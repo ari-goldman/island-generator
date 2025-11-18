@@ -1,0 +1,197 @@
+// Adapted from this paper:
+// https://www.firespark.de/resources/downloads/implementation%20of%20a%20methode%20for%20hydraulic%20erosion.pdf
+
+#version 430 core
+#extension GL_NV_shader_atomic_float : require // for atomicAdd
+
+layout(local_size_x = 128, local_size_y = 1, local_size_z = 1) in;
+
+layout(std430, binding = 0) buffer HeightsMap {
+    float heights[];
+};
+
+layout(std430, binding = 1) buffer Randoms {
+    int random[];
+};
+
+uniform ivec2 mapSize;
+uniform float time;
+
+
+
+int index(ivec2 pos) {
+    return pos.y * mapSize.x + pos.x;
+}
+
+ivec2 indexToPos(int index) {
+    return ivec2(index % mapSize.x, index / mapSize.x);
+}
+
+bool inBounds(int index) {
+    ivec2 pos = indexToPos(index);
+    if(pos.x < 0 || pos.x >= mapSize.x || pos.y < 0 || pos.y >= mapSize.y) {
+        return false;
+    } else {
+        return true;
+    }
+}
+
+
+vec3 getGradientAndHeight(vec2 pos) {
+    ivec2 intPos = ivec2(pos);
+
+
+    // position in cell
+    vec2 cellPos = vec2(pos - intPos);
+
+    // get corners of cell 
+    float heightNW = heights[index(intPos + ivec2(0, 0))];
+    float heightNE = heights[index(intPos + ivec2(1, 0))];
+    float heightSW = heights[index(intPos + ivec2(0, 1))];
+    float heightSE = heights[index(intPos + ivec2(1, 1))];
+
+    vec3 gradientHeight = vec3(
+        (heightNE - heightNW) * (1 - cellPos.x) + (heightSE - heightSW) * cellPos.x,
+        // (heightNW - heightSW) * (1 - cellPos.y) + (heightNE - heightSE) * cellPos.y,
+        (heightSW - heightNW) * (1 - cellPos.y) + (heightSE - heightNE) * cellPos.y,
+        heightNW * (1 - cellPos.x) * (1 - cellPos.y) 
+            + (heightNE * cellPos.x * (1 - cellPos.y)) 
+            + (heightSW * (1 - cellPos.x) * cellPos.y)
+            + (heightSE * cellPos.x * cellPos.y)
+    );
+
+    return gradientHeight;
+}
+
+
+void depositBilinearly(vec2 pos, float toDeposit) {
+    ivec2 intPos = ivec2(pos);
+
+
+    // position in cell
+    vec2 cellPos = vec2(pos - intPos);
+
+    int NW = index(intPos + ivec2( 0, 0));
+    int NE = index(intPos + ivec2( 1, 0));
+    int SW = index(intPos + ivec2( 0, 1));
+    int SE = index(intPos + ivec2( 1, 1));
+
+    if(inBounds(NW)) {
+        float heightNW = heights[NW];
+        atomicAdd(heights[NW], toDeposit * (1 - cellPos.x) * (1 - cellPos.y));
+    }
+
+    if(inBounds(NE)) {
+        float heightNE = heights[NE];
+        atomicAdd(heights[NE], toDeposit *      cellPos.x  * (1 - cellPos.y));
+    }
+
+    if(inBounds(SW)) {
+        float heightSW = heights[SW];
+        atomicAdd(heights[SW], toDeposit * (1 - cellPos.x) *      cellPos.y);
+    }
+
+    if(inBounds(SE)) {
+        float heightSE = heights[SE];
+        atomicAdd(heights[SE], toDeposit *      cellPos.x  *      cellPos.y);
+    }
+
+}
+
+#define BRUSH_RADIUS 3
+const float brushWeights[(BRUSH_RADIUS * 2 + 1) * (BRUSH_RADIUS * 2 + 1)] = float[(BRUSH_RADIUS * 2 + 1) * (BRUSH_RADIUS * 2 + 1)](
+    0.00000000, 0.00000000, 0.00000000, 0.00000000, 0.00000000, 0.00000000, 0.00000000,
+    0.00000000, 0.00609692, 0.02714669, 0.03553547, 0.02714669, 0.00609692, 0.00000000,
+    0.00000000, 0.02714669, 0.05635167, 0.07107095, 0.05635167, 0.02714669, 0.00000000,
+    0.00000000, 0.03553547, 0.07107095, 0.10660642, 0.07107095, 0.03553547, 0.00000000,
+    0.00000000, 0.02714669, 0.05635167, 0.07107095, 0.05635167, 0.02714669, 0.00000000,
+    0.00000000, 0.00609692, 0.02714669, 0.03553547, 0.02714669, 0.00609692, 0.00000000,
+    0.00000000, 0.00000000, 0.00000000, 0.00000000, 0.00000000, 0.00000000, 0.00000000
+);
+
+const float Kd = 0.3; // deposition rate
+const float Kc = 4;  // sediment carrying capacity (sediment/water)
+const float Ks = 0.6; // soil softness
+
+const float initVel = 5.0;
+const float initWater = 4.0;
+
+const int iterations = 20;
+
+const float intertia = 0.05;
+const float evaporation = 0.01;
+
+const float minSedimentCapacity = 0.001;
+
+const float gravity = 4;
+
+
+void main() {
+    vec2 pos;
+    vec2 dir;
+    float vel;
+    float water;
+    float sediment;
+
+    uint tid = gl_GlobalInvocationID.x
+                 + gl_GlobalInvocationID.y * (gl_NumWorkGroups.x*gl_WorkGroupSize.x)
+                 + gl_GlobalInvocationID.z * (gl_NumWorkGroups.x*gl_WorkGroupSize.x * gl_NumWorkGroups.y*gl_WorkGroupSize.y);
+
+    pos = indexToPos(random[tid]);
+
+    dir = vec2(0.0);
+    vel = initVel;
+    water = initWater;
+    sediment = 0.0;
+
+    for(int i = 0; i < iterations; i++) {
+        vec2 oldPos = pos;
+        vec3 gradientHeight = getGradientAndHeight(pos);
+
+        // update position 
+        dir = (dir * intertia) - (gradientHeight.xy * (1 - intertia));
+        dir = normalize(dir + 1e-5);
+        pos += dir;
+
+        // out of bounds
+        if((dir.x == 0 && dir.y == 0) || pos.x < 1 || pos.x > mapSize.x - 1 || pos.y < 1 || pos.y > mapSize.y - 1) {
+            break;
+        }
+
+        float newHeight = getGradientAndHeight(pos).z;
+        float dHeight = newHeight - gradientHeight.z;
+        float sedimentCapacity = max(-dHeight * vel * water * Kc, minSedimentCapacity);
+
+        // uphill or over capacity
+        if(sediment > sedimentCapacity || dHeight > 0) {
+            float toDeposit; 
+            if(dHeight > 0) {
+                // if uphill, fill the hole
+                toDeposit = min(dHeight, sediment);
+            } else {
+                // if downhill, deposit a fraction of sediment
+                toDeposit = (sediment - sedimentCapacity) * Kd;
+            }
+
+
+            // add sediment to corners of node based off bilinear interpolation
+            memoryBarrierImage();
+            depositBilinearly(oldPos, toDeposit);
+            sediment -= toDeposit;
+        } else { // downhill
+            float toErode = min((sedimentCapacity - sediment) * Ks, -dHeight);
+
+            memoryBarrierImage();
+            for(int x = -BRUSH_RADIUS; x <= BRUSH_RADIUS; x++) {
+                for(int y = -BRUSH_RADIUS; y <= BRUSH_RADIUS; y++) {
+                    depositBilinearly(oldPos + vec2(x, y), -toErode * brushWeights[(x + BRUSH_RADIUS) * (BRUSH_RADIUS * 2 + 1) + (y + BRUSH_RADIUS)]);
+
+                }
+            }
+            sediment += toErode;
+        }
+
+        vel = sqrt((vel * vel) + dHeight * gravity);
+        water = water * (1 - evaporation);
+    }
+}
