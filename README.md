@@ -18,10 +18,12 @@
 ### Use
 
 #### To run (Windows and Linux only):
-- [install the GLFW library](https://www.glfw.org/download) if you you don't have it
-- `> make`
-- `> ./island_generator`
-- `> make clean` to clear junk files and executable
+[install the GLFW library](https://www.glfw.org/download) if you you don't have it
+```bash
+$ make #compiles code and makes executable
+$ ./island_generator #or .\island_generator.exe on Windows
+$ make clean #clears junk files and executable
+```
 
 #### Controls:
 - Click and drag or arrow keys to orbit camera
